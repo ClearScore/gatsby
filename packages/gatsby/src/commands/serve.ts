@@ -8,6 +8,7 @@ import { match as reachMatch } from "@gatsbyjs/reach-router/lib/utils"
 import onExit from "signal-exit"
 import report from "gatsby-cli/lib/reporter"
 import telemetry from "gatsby-telemetry"
+import promClient from "prom-client"
 
 import { detectPortInUseAndPrompt } from "../utils/detect-port-in-use-and-prompt"
 import { getConfigFile } from "../bootstrap/get-config-file"
@@ -24,7 +25,10 @@ import { reverseFixedPagePath } from "../utils/page-data"
 import { initTracer } from "../utils/tracer"
 import { configureTrailingSlash } from "../utils/express-middlewares"
 import { getDataStore, detectLmdbStore } from "../datastore"
-import { functionMiddlewares } from "../internal-plugins/functions/middleware"
+import {
+  functionMiddlewares,
+  prometheusMiddleware,
+} from "../internal-plugins/functions/middleware"
 import {
   thirdPartyProxyPath,
   partytownProxy,
@@ -109,6 +113,10 @@ module.exports = async (program: IServeProgram): Promise<void> => {
   )
   let { prefixPaths, port, open, host } = program
   port = typeof port === `string` ? parseInt(port, 10) : port
+  const monitoringPort =
+    (typeof process.env.MONITORING_PORT === `string`
+      ? parseInt(process.env.MONITORING_PORT, 10)
+      : process.env.MONITORING_PORT) || 9125
 
   const { configModule } = await getConfigFile(
     program.directory,
@@ -123,6 +131,7 @@ module.exports = async (program: IServeProgram): Promise<void> => {
   const root = path.join(program.directory, `public`)
 
   const app = express()
+  const monitoringServer = express()
 
   // Proxy gatsby-script using off-main-thread strategy
   const { partytownProxiedURLs = [] } = config || {}
@@ -133,6 +142,42 @@ module.exports = async (program: IServeProgram): Promise<void> => {
   const router = express.Router()
 
   app.use(telemetry.expressMiddleware(`SERVE`))
+
+  app.use(prometheusMiddleware)
+
+  // Setup server to Prometheus scrapes:
+  monitoringServer.get(`/metrics`, async (_, res) => {
+    try {
+      res.set(`Content-Type`, promClient.register.contentType)
+      res.end(await promClient.register.metrics())
+    } catch (ex) {
+      res.status(500).end(ex)
+    }
+  })
+
+  monitoringServer.get(`/ping`, (_, res) => {
+    const responseBody = {
+      status: `OK`,
+    }
+    res.setHeader(`Content-Type`, `application/json`)
+    res.end(JSON.stringify(responseBody))
+  })
+
+  monitoringServer.get(`/health`, (_, res) => {
+    const responseBody = {
+      services: {},
+    }
+    res.setHeader(`Content-Type`, `application/json`)
+    res.end(JSON.stringify(responseBody))
+  })
+
+  monitoringServer.get(`/version`, (_, res) => {
+    const responseBody = {
+      version: `1.0.0`,
+    }
+    res.setHeader(`Content-Type`, `application/json`)
+    res.end(JSON.stringify(responseBody))
+  })
 
   router.use(compression())
 
@@ -373,9 +418,14 @@ module.exports = async (program: IServeProgram): Promise<void> => {
     })
   }
 
+  const startMonitoring = (): void => {
+    monitoringServer.listen(monitoringPort, host)
+  }
+
   try {
     port = await detectPortInUseAndPrompt(port)
     startListening()
+    startMonitoring()
   } catch (e) {
     if (e.message === `USER_REJECTED`) {
       return
