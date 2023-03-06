@@ -4,6 +4,7 @@ import { urlencoded, text, json, raw } from "express"
 import type { RequestHandler, Request, Response, NextFunction } from "express"
 import reporter from "gatsby-cli/lib/reporter"
 import multer from "multer"
+import promClient from "prom-client"
 
 import {
   createConfig,
@@ -18,6 +19,14 @@ const expressBuiltinMiddleware = {
   json,
   raw,
 }
+
+const httpTotalCounter = new promClient.Counter({
+  name: `cs_http_total`,
+  help: `HTTP responses counter containing "code" as dimension`,
+  labelNames: [`code`, `path`, `device`],
+})
+
+const getSanitizedStatusCode = (code): string => `${code.toString()[0]}xx`
 
 interface IGatsbyRequestContext {
   functionObj: IGatsbyFunction
@@ -134,6 +143,26 @@ function createSetContextFunctionMiddleware({
 
     next()
   }
+}
+
+export function prometheusMiddleware(req, res, next): void {
+  next()
+
+  res.on(`finish`, () => {
+    const statusCode = getSanitizedStatusCode(res.statusCode)
+
+    const device = req.query.deviceType || `unknown`
+    const { path, method } = req
+
+    const metricPath = `${method} ${path}`
+
+    // Increment cs_http_total counter
+    httpTotalCounter.inc({
+      device,
+      path: metricPath,
+      code: statusCode,
+    })
+  })
 }
 
 function setCookies(
